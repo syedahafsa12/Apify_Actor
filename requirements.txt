@@ -1,0 +1,26 @@
+# =========================================================
+# requirements.txt for Apify Actor v7.0
+# =========================================================
+
+# Core Apify
+apify>=3.0.0
+playwright>=1.40.0
+
+# HTTP clients
+httpx>=0.24.0
+
+# AI providers
+google-generativeai>=0.3.0
+openai>=1.0.0
+
+# Redis cache (optional - graceful fallback to in-memory if unavailable)
+redis[asyncio]>=4.6.0
+
+# DNS validation for generated email safety
+dnspython>=2.4.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Utilities
+python-dateutil>=2.8.0

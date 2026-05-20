@@ -1,0 +1,13 @@
+{
+  "actorSpecification": 1,
+  "name": "job-auto-apply",
+  "title": "Job Auto Apply (Playwright)",
+  "description": "Opens job links (Adzuna, Jooble, GulfTalent), applies, and posts proof screenshots back to our FastAPI.",
+  "version": "0.1",
+  "buildTag": "latest",
+  "input": "./input_schema.json",
+  "dockerfile": "./Dockerfile",
+  "environmentVariables": {
+    "API_BASE": "https://forestry-penguin-refine-relax.trycloudflare.com"
+  }
+}

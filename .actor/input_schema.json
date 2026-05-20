@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "title": "Job Auto Apply Input",
+  "type": "object",
+  "description": "Defines input parameters for automated job application runs.",
+  "properties": {
+    "token": {
+      "title": "User Token",
+      "type": "string",
+      "description": "Bearer token used to authenticate API requests to your FastAPI backend.",
+      "editor": "textfield"
+    },
+    "run_id": {
+      "title": "Automation Run ID",
+      "type": "string",
+      "description": "Unique ID for this automation session, created by the FastAPI backend.",
+      "editor": "textfield"
+    },
+    "cv_json": {
+      "title": "CV JSON",
+      "type": "object",
+      "description": "Parsed CV data (title, skills, contact info) used for scoring.",
+      "editor": "json"
+    },
+    "cv_file_url": {
+      "title": "CV File URL",
+      "type": "string",
+      "description": "Public link to user's CV file, used for file upload if needed.",
+      "editor": "textfield"
+    },
+    "jobs": {
+      "title": "Jobs List",
+      "type": "array",
+      "description": "List of jobs fetched from Adzuna/Jooble/GulfTalent with title, company, and URL.",
+      "editor": "json",
+      "items": {
+        "type": "object"
+      }
+    },
+    "min_match_score": {
+      "title": "Minimum Match Score",
+      "type": "integer",
+      "description": "Jobs below this match score will be skipped.",
+      "default": 40,
+      "editor": "number"
+    },
+    "max_jobs": {
+      "title": "Maximum Jobs",
+      "type": "integer",
+      "description": "Maximum number of jobs to apply in this automation run.",
+      "default": 100,
+      "editor": "number"
+    }
+  },
+  "required": ["token", "run_id", "jobs"]
+}
