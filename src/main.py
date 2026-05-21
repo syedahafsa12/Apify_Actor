@@ -549,8 +549,8 @@ class ProspeoEmailDiscovery:
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.post(
-                    "https://api.prospeo.io/email-finder",
-                    json={"company": clean},
+                    "https://api.prospeo.io/domain-search",
+                    json={"company": clean, "limit": 10},
                     headers={"X-KEY": self.api_key, "Content-Type": "application/json"}
                 )
 
@@ -561,14 +561,7 @@ class ProspeoEmailDiscovery:
                         return []
 
                     emails = []
-                    resp = data.get("response", {})
-
-                    # Handle list or single-email response
-                    email_items = resp.get("emails") or []
-                    if not email_items and resp.get("email"):
-                        email_items = [resp]
-
-                    for item in email_items:
+                    for item in data.get("response", {}).get("emails", []):
                         email = item.get("email", "").lower().strip()
                         validity = item.get("validity", "unknown")
                         if validity == "valid" and email:
@@ -805,7 +798,7 @@ async def enqueue_email(
     cache: RedisCache,
     email_source: str = "unknown"
 ) -> bool:
-    """Enqueue single email to backend queue. Returns True if queued or already sent."""
+    """Enqueue single email to backend queue. Returns True if successfully queued."""
     normalized = normalize_api_base(api_base)
     if not normalized:
         return False
@@ -815,23 +808,17 @@ async def enqueue_email(
     company = job.get("company", "")
     job_url = job.get("url") or job.get("link", "")
 
-    # Dedup: skip if already enqueued this run
+    # Dedup: skip if already enqueued this run+job+email combination
     dedup_key = f"sent:{run_id}:{job_id}:{to_email}"
     if await cache.exists(dedup_key):
         print(f"[Enqueue] ⏭️ Duplicate: {to_email}")
-        return True
+        return False
 
-    # Recruiter memory: skip if already contacted this recruiter
+    # Recruiter memory: skip if already contacted this specific recruiter (cross-run)
     recruiter_key = f"recruiter:{to_email}"
     if await cache.exists(recruiter_key):
         print(f"[Enqueue] ⏭️ Recruiter already contacted: {to_email}")
-        return True
-
-    # Company memory: skip if already contacted this company
-    company_key = f"recruiter_company:{company.lower().replace(' ', '_')[:60]}"
-    if await cache.exists(company_key):
-        print(f"[Enqueue] ⏭️ Company already contacted: {company}")
-        return True
+        return False
 
     applicant_name = cv_json.get('name', '')
     applicant_email = cv_json.get('email') or cv_json.get('contact', {}).get('email', '')
@@ -863,7 +850,6 @@ async def enqueue_email(
                 ttl_7d = 7 * 24 * 3600
                 await cache.set(dedup_key, "1", ttl=ttl_7d)
                 await cache.set(recruiter_key, "1", ttl=ttl_7d)
-                await cache.set(company_key, "1", ttl=ttl_7d)
                 print(f"[Enqueue] ✅ Queued: {to_email}")
                 return True
             print(f"[Enqueue] ❌ HTTP {response.status_code}: {response.text[:150]}")
@@ -887,6 +873,14 @@ async def enqueue_emails_for_job(
     email_source: str = "unknown"
 ) -> int:
     """Enqueue all emails for a job. Returns count of successfully queued emails."""
+    company = job.get("company", "")
+    company_key = f"recruiter_company:{company.lower().replace(' ', '_')[:60]}"
+
+    # Company-level cross-run dedup: if this company was already contacted, skip all
+    if await cache.exists(company_key):
+        print(f"[Enqueue] ⏭️ Company already contacted: {company}")
+        return 0
+
     queued = 0
     for email in emails:
         ok = await enqueue_email(
@@ -894,6 +888,11 @@ async def enqueue_emails_for_job(
         )
         if ok:
             queued += 1
+
+    # Mark company as contacted after all emails for this job are processed
+    if queued > 0:
+        await cache.set(company_key, "1", ttl=7 * 24 * 3600)
+
     return queued
 
 # =========================================================
