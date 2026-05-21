@@ -145,15 +145,17 @@ async def enqueue_emails_for_job(
     api_base: str,
     cache: RedisCache,
     email_source: str = "unknown",
-) -> int:
+) -> tuple[int, str]:
     """Enqueue all emails for a job with company-level cross-run dedup.
-    Returns count of successfully queued emails."""
+    Returns (count_queued, skip_reason).
+    skip_reason is 'already_contacted' when dedup fired, '' otherwise.
+    """
     company = job.get("company", "")
     company_key = f"recruiter_company:{company.lower().replace(' ', '_')[:60]}"
 
     if await cache.exists(company_key):
         print(f"[Enqueue] ⏭️ Company already contacted: {company}")
-        return 0
+        return 0, "already_contacted"
 
     queued = 0
     for email in emails:
@@ -166,4 +168,4 @@ async def enqueue_emails_for_job(
     if queued > 0:
         await cache.set(company_key, "1", ttl=TTL_7DAYS)
 
-    return queued
+    return queued, ""

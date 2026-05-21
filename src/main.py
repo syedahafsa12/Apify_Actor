@@ -117,8 +117,9 @@ async def send_callback_to_backend(
         return False
 
     # "success" here means emails were enqueued for async delivery, not confirmed sent
-    successful           = sum(1 for jr in job_results if jr.status == "success")
-    failed               = sum(1 for jr in job_results if jr.status in ("failed", "skipped"))
+    successful            = sum(1 for jr in job_results if jr.status == "success")
+    skipped_dedup         = sum(1 for jr in job_results if jr.status == "skipped")
+    failed_actual         = sum(1 for jr in job_results if jr.status == "failed")
     total_emails_enqueued = sum(jr.emails_enqueued for jr in job_results)
 
     payload = {
@@ -126,10 +127,11 @@ async def send_callback_to_backend(
         "user_id":                   user_id,
         "status":                    status,
         "total_jobs":                total_jobs,
-        "jobs_with_emails_enqueued": successful,      # jobs where ≥1 email entered the queue
-        "successful_applications":   successful,      # kept for backend compatibility
-        "emails_enqueued":           total_emails_enqueued,  # total email items queued
-        "failed_applications":       failed,
+        "successful_applications":   successful,          # jobs where ≥1 email entered the queue
+        "failed_applications":       failed_actual,       # genuine failures only (not dedup skips)
+        "already_contacted":         skipped_dedup,       # dedup hits — NOT failures
+        "emails_enqueued":           total_emails_enqueued,
+        "jobs_with_emails_enqueued": successful,
         "job_results":               [jr.to_dict() for jr in job_results],
         "error_message":             error_message,
         "completed_at":              datetime.now(timezone.utc).isoformat(),
@@ -236,6 +238,7 @@ async def run_actor():
             "ai_fallbacks":          0,
             "applications_success":  0,
             "applications_failed":   0,
+            "already_contacted":     0,   # dedup hits — NOT failures
         }
 
         actor.log.info("=" * 60)
@@ -379,12 +382,25 @@ async def run_actor():
                                 "method":       method,
                             })
 
-                            enqueued = await enqueue_emails_for_job(
+                            enqueued, skip_reason = await enqueue_emails_for_job(
                                 run_id, user_id, job, emails, cv_json, cv_file_url,
                                 api_base, cache, email_source=method,
                             )
 
-                            if enqueued > 0:
+                            if skip_reason == "already_contacted":
+                                # Dedup worked correctly — this is NOT a failure
+                                job_result.mark_skipped("Company already contacted in a previous run")
+                                async with stats_lock:
+                                    stats["already_contacted"] += 1
+                                    stats["processed"]         += 1
+                                actor.log.info(f"⏭️ Already contacted: {company_info['company_name']} — skipped")
+                                await log_to_backend(run_id, user_id, api_base, {
+                                    "type":    "info",
+                                    "msg":     f"⏭️ Already contacted {company_info['company_name']} in a previous run — skipped (dedup)",
+                                    "job_title": title,
+                                    "company": company_info["company_name"],
+                                })
+                            elif enqueued > 0:
                                 job_result.mark_success(emails_enqueued=enqueued, application_url=url)
                                 async with stats_lock:
                                     stats["emails_enqueued"]      += enqueued
@@ -405,7 +421,7 @@ async def run_actor():
                                     "emails_enqueued": enqueued,
                                 })
                             else:
-                                job_result.mark_failed("Enqueue request failed or all duplicates")
+                                job_result.mark_failed("Enqueue request failed")
                                 async with stats_lock:
                                     stats["applications_failed"] += 1
                                     stats["processed"]           += 1
@@ -438,12 +454,22 @@ async def run_actor():
 
             await cache.close()
 
-            successful = sum(1 for jr in job_results if jr.status == "success")
-            failed     = sum(1 for jr in job_results if jr.status in ("failed", "skipped"))
+            successful        = sum(1 for jr in job_results if jr.status == "success")
+            already_contacted = stats.get("already_contacted", 0)
+            # Only count genuine failures — not dedup skips
+            failed = sum(
+                1 for jr in job_results
+                if jr.status == "failed"
+                # "skipped" with dedup reason is NOT a failure
+                or (jr.status == "skipped" and jr.error_message != "Company already contacted in a previous run")
+            )
 
             if successful > 0 and failed > 0:
                 final_status = "partial"
             elif successful > 0:
+                final_status = "completed"
+            elif already_contacted > 0 and failed == 0:
+                # All jobs were dedup-skipped — deduplication worked correctly
                 final_status = "completed"
             else:
                 final_status = "failed"
