@@ -6,6 +6,8 @@ import httpx
 
 from .redis_cache import RedisCache, TTL_7DAYS
 
+_run_enqueued_emails: dict[str, set] = {}
+
 _CLOSING_PREFIXES = frozenset({
     "best regards", "kind regards", "sincerely", "regards",
     "cv attached", "one attachment", "scanned by",
@@ -84,6 +86,13 @@ async def enqueue_email(
     job_title = job.get("title", "")
     company = job.get("company", "")
     job_url = job.get("url") or job.get("link", "")
+
+    # In-batch dedup: prevent same email being sent twice in one run
+    run_set = _run_enqueued_emails.setdefault(run_id, set())
+    if to_email in run_set:
+        print(f"[Enqueue] ⏭️ Skipping duplicate in current batch: {to_email}")
+        return False
+    run_set.add(to_email)
 
     dedup_key = f"sent:{run_id}:{job_id}:{to_email}"
     if await cache.exists(dedup_key):
@@ -167,5 +176,9 @@ async def enqueue_emails_for_job(
 
     if queued > 0:
         await cache.set(company_key, "1", ttl=TTL_7DAYS)
+        # Keep memory bounded: evict oldest run sets beyond last 3
+        if len(_run_enqueued_emails) > 3:
+            oldest = next(iter(_run_enqueued_emails))
+            del _run_enqueued_emails[oldest]
 
     return queued, ""
