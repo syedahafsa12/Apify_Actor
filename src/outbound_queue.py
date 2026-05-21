@@ -1,27 +1,70 @@
 import asyncio
+import re
 from typing import Dict, List
 
 import httpx
 
 from .redis_cache import RedisCache, TTL_7DAYS
 
+_CLOSING_PREFIXES = frozenset({
+    "best regards", "kind regards", "sincerely", "regards",
+    "cv attached", "one attachment", "scanned by",
+})
+
+
+def _strip_summary_boilerplate(text: str, name: str, email: str) -> str:
+    """Remove greeting lines and trailing signature block from a pre-written summary."""
+    lines = text.strip().splitlines()
+
+    # Drop leading blank lines and any "Dear ..." greeting
+    while lines and (not lines[0].strip() or re.match(r"^dear\b", lines[0].strip(), re.IGNORECASE)):
+        lines.pop(0)
+
+    # Drop trailing blank lines, then trailing signature / closing lines
+    name_lc  = name.lower()
+    email_lc = email.lower()
+    while lines:
+        last = lines[-1].strip()
+        ll   = last.lower()
+        if (
+            not last
+            or any(ll.startswith(p) for p in _CLOSING_PREFIXES)
+            or (name_lc  and name_lc  in ll)
+            or (email_lc and email_lc in ll)
+            or re.match(r"^\+?\d[\d\s\-\(\)]{6,}$", last)   # phone number
+        ):
+            lines.pop()
+        else:
+            break
+
+    return "\n".join(lines).strip()
+
 
 def _build_cover_letter(cv_json: Dict, job_title: str, company: str) -> str:
-    name = cv_json.get('name', 'Job Applicant')
-    summary = cv_json.get('summary', '')
-    skills = cv_json.get('skills', [])
-    email = cv_json.get('email') or cv_json.get('contact', {}).get('email', '')
-    body = (
-        f"Dear {company} Hiring Team,\n\n"
-        f"I am writing to express my interest in the {job_title} position at {company}.\n\n"
-    )
+    name    = cv_json.get("name", "Job Applicant")
+    summary = cv_json.get("summary", "")
+    skills  = cv_json.get("skills", [])
+    email   = cv_json.get("email") or cv_json.get("contact", {}).get("email", "")
+    phone   = cv_json.get("phone") or cv_json.get("contact", {}).get("phone", "") or ""
+
+    greeting = f"Dear {company} Hiring Team," if company else "Dear Hiring Team,"
+    body = f"{greeting}\n\n"
+
     if summary:
-        body += f"{summary}\n\n"
+        cleaned = _strip_summary_boilerplate(summary, name, email)
+        if cleaned:
+            body += f"{cleaned}\n\n"
+    else:
+        body += f"I am writing to express my interest in the {job_title} position at {company}.\n\n"
+
     if skills:
         body += f"Key skills: {', '.join(str(s) for s in skills[:8])}.\n\n"
+
     body += f"I have attached my CV for your review.\n\nBest regards,\n{name}"
     if email:
         body += f"\n{email}"
+    if phone:
+        body += f"\n{phone}"
     return body
 
 

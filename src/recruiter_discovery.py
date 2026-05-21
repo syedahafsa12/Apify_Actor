@@ -7,11 +7,13 @@ import httpx
 from playwright.async_api import Browser, Page, TimeoutError as PlaywrightTimeout
 from openai import AsyncOpenAI
 
+import json
+
 try:
-    import google.generativeai as genai
-    _GENAI_AVAILABLE = True
+    from mistralai import Mistral as _MistralClient
+    _MISTRAL_AVAILABLE = True
 except ImportError:
-    _GENAI_AVAILABLE = False
+    _MISTRAL_AVAILABLE = False
 
 try:
     import dns.resolver as _dns_resolver
@@ -93,19 +95,18 @@ async def check_domain_has_mx(domain: str) -> bool:
 # AI COMPANY IDENTIFICATION
 # =========================================================
 class SmartCompanyDiscovery:
-    def __init__(self, gemini_key: str = "", openai_key: str = "", cache: Optional[RedisCache] = None):
+    def __init__(self, mistral_key: str = "", openai_key: str = "", cache: Optional[RedisCache] = None):
         self.cache = cache
-        self._gemini_error_count = 0
-        self.gemini_available = False
+        self._mistral_error_count = 0
+        self.mistral_available = False
 
-        if gemini_key and _GENAI_AVAILABLE:
+        if mistral_key and _MISTRAL_AVAILABLE:
             try:
-                genai.configure(api_key=gemini_key)
-                self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
-                self.gemini_available = True
-                print("[AI] ✅ Gemini initialized")
+                self._mistral = _MistralClient(api_key=mistral_key)
+                self.mistral_available = True
+                print("[AI] ✅ Mistral initialized (mistral-small-latest)")
             except Exception as e:
-                print(f"[AI] ⚠️ Gemini init failed: {str(e)[:60]}")
+                print(f"[AI] ⚠️ Mistral init failed: {str(e)[:60]}")
 
         self.openai_available = False
         if openai_key:
@@ -135,8 +136,8 @@ Rules:
 Return:
 {{"company_name":"...","company_domain":"domain.com","company_location":"City, Country","industry":"...","is_recruitment_agency":false,"confidence":"high|medium|low","reasoning":"..."}}"""
 
-        if self.gemini_available:
-            result = await self._try_gemini(prompt)
+        if self.mistral_available:
+            result = await self._try_mistral(prompt)
             if result:
                 return result
 
@@ -145,36 +146,38 @@ Return:
 
         return None
 
-    async def _try_gemini(self, prompt: str) -> Optional[Dict]:
-        if self.cache and await self.cache.exists("gemini:cooldown"):
-            print("[Gemini] ⏸️ In cooldown - skipping to OpenAI")
+    async def _try_mistral(self, prompt: str) -> Optional[Dict]:
+        if self.cache and await self.cache.exists("mistral:cooldown"):
+            print("[Mistral] ⏸️ In cooldown - skipping to OpenAI")
             return None
         try:
             response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.gemini_model.generate_content, prompt,
-                    generation_config={'temperature': 0.5, 'max_output_tokens': 512}
+                self._mistral.chat.complete_async(
+                    model="mistral-small-latest",
+                    messages=[{"role": "user", "content": prompt}]
                 ),
-                timeout=25
+                timeout=25,
             )
-            match = re.search(r'\{[\s\S]*?\}', response.text.strip())
+            text = (response.choices[0].message.content or "").strip()
+            match = re.search(r'\{[\s\S]*?\}', text)
             if match:
-                result = __import__('json').loads(match.group(0))
-                self._gemini_error_count = 0
-                print(f"[Gemini] ✅ {result.get('company_name')}")
+                result = json.loads(match.group(0))
+                self._mistral_error_count = 0
+                print(f"[Mistral] ✅ {result.get('company_name')}")
                 return result
+            print("[Mistral] ⚠️ No JSON object in response")
         except asyncio.TimeoutError:
-            print("[Gemini] ⏱️ Timeout")
+            print("[Mistral] ⏱️ Timeout")
         except Exception as e:
             err = str(e).lower()
-            if "429" in err or "quota" in err or "rate" in err:
-                self._gemini_error_count += 1
-                print(f"[Gemini] ⚠️ Quota error #{self._gemini_error_count}")
-                if self._gemini_error_count >= 3 and self.cache:
-                    await self.cache.set("gemini:cooldown", "1", ttl=TTL_GEMINI_CD)
-                    print("[Gemini] ❌ Entering 30min cooldown")
+            if "429" in err or "rate" in err or "quota" in err:
+                self._mistral_error_count += 1
+                print(f"[Mistral] ⚠️ Rate limit #{self._mistral_error_count}")
+                if self._mistral_error_count >= 3 and self.cache:
+                    await self.cache.set("mistral:cooldown", "1", ttl=TTL_GEMINI_CD)
+                    print("[Mistral] ❌ Entering 30min cooldown")
             else:
-                print(f"[Gemini] ❌ {str(e)[:80]}")
+                print(f"[Mistral] ❌ {str(e)[:80]}")
         return None
 
     async def _try_openai(self, prompt: str) -> Optional[Dict]:
@@ -189,9 +192,9 @@ Return:
                     temperature=0.5, max_tokens=512,
                     response_format={"type": "json_object"}
                 ),
-                timeout=25
+                timeout=25,
             )
-            result = __import__('json').loads(response.choices[0].message.content.strip())
+            result = json.loads(response.choices[0].message.content.strip())
             print(f"[OpenAI] ✅ {result.get('company_name')}")
             return result
         except asyncio.TimeoutError:
@@ -373,7 +376,7 @@ class RecruiterDiscovery:
         prospeo: ProspeoClient,
         cache: RedisCache,
         hunter_key: str = "",
-        gemini_key: str = "",
+        mistral_key: str = "",
         openai_key: str = "",
     ):
         self.browser = browser
@@ -381,7 +384,7 @@ class RecruiterDiscovery:
         self.pipeline = EnrichmentPipeline(prospeo, cache)
         self.hunter = HunterEmailDiscovery(hunter_key)
         self.scraper = EnhancedEmailScraper()
-        self.company_ai = SmartCompanyDiscovery(gemini_key, openai_key, cache)
+        self.company_ai = SmartCompanyDiscovery(mistral_key, openai_key, cache)
 
     async def discover(
         self,

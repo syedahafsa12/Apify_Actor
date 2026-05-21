@@ -48,7 +48,13 @@ class RedisCache:
         for attempt in range(1, 4):
             try:
                 self._client = aioredis.from_url(
-                    url, decode_responses=True, socket_connect_timeout=5
+                    url,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    socket_keepalive=True,
+                    socket_timeout=5,
+                    retry_on_timeout=True,
+                    health_check_interval=30,
                 )
                 await self._client.ping()
                 self._available = True

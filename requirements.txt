@@ -10,7 +10,7 @@ playwright>=1.40.0
 httpx>=0.24.0
 
 # AI providers
-google-generativeai>=0.3.0
+mistralai>=2.0.0
 openai>=1.0.0
 
 # Redis cache (optional - graceful fallback to in-memory if unavailable)

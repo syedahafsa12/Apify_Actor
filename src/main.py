@@ -200,7 +200,7 @@ async def run_actor():
         input_data = await actor.get_input() or {}
 
         api_base    = normalize_api_base(input_data.get("API_BASE") or os.getenv("API_BASE", ""))
-        gemini_key  = input_data.get("GEMINI_API_KEY")  or os.getenv("GEMINI_API_KEY", "")
+        mistral_key = input_data.get("MISTRAL_API_KEY") or os.getenv("MISTRAL_API_KEY", "")
         openai_key  = input_data.get("OPENAI_API_KEY")  or os.getenv("OPENAI_API_KEY", "")
         hunter_key  = input_data.get("HUNTER_API_KEY")  or os.getenv("HUNTER_API_KEY", "")
         prospeo_key = input_data.get("PROSPEO_API_KEY") or os.getenv("PROSPEO_API_KEY", "")
@@ -288,7 +288,7 @@ async def run_actor():
                     prospeo=prospeo,
                     cache=cache,
                     hunter_key=hunter_key,
-                    gemini_key=gemini_key,
+                    mistral_key=mistral_key,
                     openai_key=openai_key,
                 )
 

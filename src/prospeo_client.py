@@ -88,6 +88,13 @@ class ProspeoClient:
                         continue
 
                     if response.status_code == 400:
+                        try:
+                            err_body = response.json()
+                        except Exception:
+                            err_body = {}
+                        if err_body.get("error_code") == "NO_RESULTS":
+                            print(f"[Prospeo] ℹ️ No matches found for {endpoint}. Triggering Hunter.io fallback...")
+                            return None
                         print(f"[Prospeo] ❌ HTTP 400 — Bad Request")
                         print(f"[Prospeo]   Endpoint : {url}")
                         print(f"[Prospeo]   Payload  : {payload}")
