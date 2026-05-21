@@ -14,7 +14,7 @@ google-generativeai>=0.3.0
 openai>=1.0.0
 
 # Redis cache (optional - graceful fallback to in-memory if unavailable)
-redis[asyncio]>=4.6.0
+redis>=4.6.0
 
 # DNS validation for generated email safety
 dnspython>=2.4.0
