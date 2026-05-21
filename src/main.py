@@ -62,17 +62,39 @@ class RedisCache:
         self._available = False
 
     async def connect(self):
-        if not _REDIS_AVAILABLE or not self._redis_url:
-            print("[Redis] ⚠️ Unavailable - using in-memory cache")
+        if not _REDIS_AVAILABLE:
+            print("[Redis] ⚠️ redis package not installed - using in-memory cache")
             return
-        try:
-            self._client = aioredis.from_url(self._redis_url, decode_responses=True)
-            await self._client.ping()
-            self._available = True
-            print("[Redis] ✅ Connected")
-        except Exception as e:
-            print(f"[Redis] ⚠️ Connection failed: {str(e)[:60]} - using in-memory cache")
-            self._client = None
+
+        url = self._redis_url
+        if not url:
+            host = os.getenv("REDISHOST", "")
+            port = os.getenv("REDISPORT", "6379")
+            password = os.getenv("REDISPASSWORD", "")
+            if host:
+                url = f"redis://:{password}@{host}:{port}" if password else f"redis://{host}:{port}"
+
+        if not url:
+            print("[Redis] ⚠️ No Redis URL configured - using in-memory cache")
+            return
+
+        for attempt in range(1, 4):
+            try:
+                self._client = aioredis.from_url(
+                    url, decode_responses=True, socket_connect_timeout=5
+                )
+                await self._client.ping()
+                self._available = True
+                print("[Redis] ✅ Connected")
+                return
+            except Exception as e:
+                reason = str(e)[:80]
+                if attempt < 3:
+                    print(f"[Redis] ⚠️ Attempt {attempt}/3 failed: {reason} - retrying...")
+                    await asyncio.sleep(1)
+                else:
+                    print(f"[Redis] ⚠️ All 3 attempts failed: {reason} - using in-memory cache")
+                    self._client = None
 
     async def get(self, key: str) -> Optional[str]:
         try:
@@ -176,6 +198,31 @@ def is_valid_api_base(api_base: str) -> bool:
 def _is_ssl_error(error: Exception) -> bool:
     msg = str(error).lower()
     return any(kw in msg for kw in ['ssl', 'certificate', 'tls', 'cert'])
+
+_INVALID_DOMAIN_VALUES = {
+    'not identified', 'notidentified', 'unknown', 'none', 'null', 'n/a', 'na',
+    'localhost', 'not specified', 'notfound', 'not found', 'example.com',
+    'test.com', 'company.com', 'domain.com', ''
+}
+
+def normalize_domain(raw: str) -> str:
+    """Normalize to clean FQDN. Returns '' if invalid/placeholder."""
+    if not raw:
+        return ""
+    domain = raw.lower().strip()
+    domain = re.sub(r'^https?://', '', domain)
+    domain = domain.split('/')[0].split('?')[0].split('#')[0].strip()
+    domain = domain.replace(' ', '')
+    if not domain or domain in _INVALID_DOMAIN_VALUES:
+        return ""
+    if '.' not in domain:
+        return ""
+    tld = domain.rsplit('.', 1)[-1]
+    if not re.match(r'^[a-z]{2,6}$', tld):
+        return ""
+    if not re.match(r'^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?$', domain):
+        return ""
+    return domain
 
 async def check_domain_alive(domain: str) -> bool:
     try:
@@ -490,18 +537,20 @@ class ProspeoEmailDiscovery:
     async def find_company_emails(self, domain: str, company_name: str) -> List[str]:
         if not self.available:
             return []
-        domain = domain.replace('http://', '').replace('https://', '').split('/')[0].strip()
-        if not domain:
+
+        clean = normalize_domain(domain)
+        if not clean:
+            print(f"[Prospeo] ⏭️ Invalid domain '{domain}' - skipping")
             return []
 
-        print(f"[Prospeo] 🔍 Searching {domain}...")
+        print(f"[Prospeo] 🔍 Searching {clean}...")
         await self._rate_limit()
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 response = await client.post(
-                    "https://api.prospeo.io/domain-search",
-                    json={"company": domain, "limit": 10},
+                    "https://api.prospeo.io/email-finder",
+                    json={"company": clean},
                     headers={"X-KEY": self.api_key, "Content-Type": "application/json"}
                 )
 
@@ -512,19 +561,25 @@ class ProspeoEmailDiscovery:
                         return []
 
                     emails = []
-                    for item in data.get("response", {}).get("emails", []):
+                    resp = data.get("response", {})
+
+                    # Handle list or single-email response
+                    email_items = resp.get("emails") or []
+                    if not email_items and resp.get("email"):
+                        email_items = [resp]
+
+                    for item in email_items:
                         email = item.get("email", "").lower().strip()
                         validity = item.get("validity", "unknown")
                         if validity == "valid" and email:
                             emails.append(email)
-                            print(f"[Prospeo]   ✅ {email} (valid)")
-                        else:
-                            print(f"[Prospeo]   ⏭️ Skipped {email} ({validity})")
 
                     print(f"[Prospeo] ✅ {len(emails)} valid emails")
                     return emails[:5]
 
-                if response.status_code == 429:
+                if response.status_code == 400:
+                    print(f"[Prospeo] ⚠️ Bad request for domain: {clean}")
+                elif response.status_code == 429:
                     print("[Prospeo] ⚠️ Rate limit exceeded")
                 elif response.status_code == 401:
                     print("[Prospeo] ❌ Invalid API key")
@@ -638,7 +693,14 @@ class CompleteEmailDiscovery:
             }
 
         raw_domain = company_info.get('company_domain', '')
-        domain = raw_domain.replace('https://', '').replace('http://', '').split('/')[0].strip()
+        domain = normalize_domain(raw_domain)
+
+        if not domain:
+            print(f"[Discovery] ⚠️ AI returned invalid domain '{raw_domain}' for {company_name_hint}")
+            return {
+                'success': False, 'emails': [], 'company_info': company_info,
+                'method': 'failed', 'cache_hit': False, 'confidence': 'none'
+            }
 
         print(f"[Discovery] 🏢 {company_info['company_name']} | 🌐 {domain}")
 
@@ -714,52 +776,125 @@ class CompleteEmailDiscovery:
         }
 
 # =========================================================
-# ENQUEUE (replaces all direct sending)
+# ENQUEUE (one POST per email to /v1/automation/email-apply)
 # =========================================================
-async def enqueue_emails_for_job(
+def _build_cover_letter(cv_json: Dict, job_title: str, company: str) -> str:
+    name = cv_json.get('name', 'Job Applicant')
+    summary = cv_json.get('summary', '')
+    skills = cv_json.get('skills', [])
+    email = cv_json.get('email') or cv_json.get('contact', {}).get('email', '')
+    body = f"Dear {company} Hiring Team,\n\nI am writing to express my interest in the {job_title} position at {company}.\n\n"
+    if summary:
+        body += f"{summary}\n\n"
+    if skills:
+        body += f"Key skills: {', '.join(str(s) for s in skills[:8])}.\n\n"
+    body += f"I have attached my CV for your review.\n\nBest regards,\n{name}"
+    if email:
+        body += f"\n{email}"
+    return body
+
+
+async def enqueue_email(
     run_id: str,
     user_id: str,
     job: Dict,
-    emails: List[str],
-    cv_url: str,
-    api_base: str
+    to_email: str,
+    cv_json: Dict,
+    cv_file_url: str,
+    api_base: str,
+    cache: RedisCache,
+    email_source: str = "unknown"
 ) -> bool:
+    """Enqueue single email to backend queue. Returns True if queued or already sent."""
     normalized = normalize_api_base(api_base)
     if not normalized:
-        print("[Enqueue] ❌ Invalid API_BASE")
         return False
+
+    job_id = str(job.get("id") or job.get("job_id") or "")
+    job_title = job.get("title", "")
+    company = job.get("company", "")
+    job_url = job.get("url") or job.get("link", "")
+
+    # Dedup: skip if already enqueued this run
+    dedup_key = f"sent:{run_id}:{job_id}:{to_email}"
+    if await cache.exists(dedup_key):
+        print(f"[Enqueue] ⏭️ Duplicate: {to_email}")
+        return True
+
+    # Recruiter memory: skip if already contacted this recruiter
+    recruiter_key = f"recruiter:{to_email}"
+    if await cache.exists(recruiter_key):
+        print(f"[Enqueue] ⏭️ Recruiter already contacted: {to_email}")
+        return True
+
+    # Company memory: skip if already contacted this company
+    company_key = f"recruiter_company:{company.lower().replace(' ', '_')[:60]}"
+    if await cache.exists(company_key):
+        print(f"[Enqueue] ⏭️ Company already contacted: {company}")
+        return True
+
+    applicant_name = cv_json.get('name', '')
+    applicant_email = cv_json.get('email') or cv_json.get('contact', {}).get('email', '')
+    applicant_phone = cv_json.get('phone') or cv_json.get('contact', {}).get('phone', '') or ''
+    cover_letter = _build_cover_letter(cv_json, job_title, company)
 
     payload = {
         "run_id": run_id,
-        "user_id": user_id,
-        "job": {
-            "title": job.get("title", ""),
-            "company": job.get("company", ""),
-            "job_url": job.get("url") or job.get("link", ""),
-            "description": (job.get("description") or job.get("snippet", ""))[:2000],
-            "location": job.get("location", "")
-        },
-        "emails": emails,
-        "cv_url": cv_url
+        "job_url": job_url,
+        "job_title": job_title,
+        "company": company,
+        "to_email": to_email,
+        "cv_file_url": cv_file_url,
+        "cover_letter": cover_letter,
+        "applicant_name": applicant_name,
+        "applicant_email": applicant_email,
+        "applicant_phone": applicant_phone,
+        "ai_discovery": {"email_source": email_source, "user_id": user_id}
     }
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
-                f"{normalized}/v1/automation/enqueue-emails",
+                f"{normalized}/v1/automation/email-apply",
                 json=payload,
                 headers={"Content-Type": "application/json"}
             )
             if response.status_code in (200, 201, 202):
-                print(f"[Enqueue] 📥 Enqueued {len(emails)} emails for {job.get('company', '?')}")
+                ttl_7d = 7 * 24 * 3600
+                await cache.set(dedup_key, "1", ttl=ttl_7d)
+                await cache.set(recruiter_key, "1", ttl=ttl_7d)
+                await cache.set(company_key, "1", ttl=ttl_7d)
+                print(f"[Enqueue] ✅ Queued: {to_email}")
                 return True
-            print(f"[Enqueue] ❌ HTTP {response.status_code}: {response.text[:200]}")
+            print(f"[Enqueue] ❌ HTTP {response.status_code}: {response.text[:150]}")
     except asyncio.TimeoutError:
         print("[Enqueue] ⏱️ Timeout")
     except Exception as e:
         print(f"[Enqueue] ❌ {str(e)[:80]}")
 
     return False
+
+
+async def enqueue_emails_for_job(
+    run_id: str,
+    user_id: str,
+    job: Dict,
+    emails: List[str],
+    cv_json: Dict,
+    cv_file_url: str,
+    api_base: str,
+    cache: RedisCache,
+    email_source: str = "unknown"
+) -> int:
+    """Enqueue all emails for a job. Returns count of successfully queued emails."""
+    queued = 0
+    for email in emails:
+        ok = await enqueue_email(
+            run_id, user_id, job, email, cv_json, cv_file_url, api_base, cache, email_source
+        )
+        if ok:
+            queued += 1
+    return queued
 
 # =========================================================
 # SSE LOGGING
@@ -1050,32 +1185,33 @@ async def run_actor():
                             })
 
                             enqueued = await enqueue_emails_for_job(
-                                run_id, user_id, job, emails, cv_file_url, api_base
+                                run_id, user_id, job, emails, cv_json, cv_file_url,
+                                api_base, cache, email_source=method
                             )
 
-                            if enqueued:
+                            if enqueued > 0:
                                 job_result.mark_success(
-                                    emails_enqueued=len(emails),
+                                    emails_enqueued=enqueued,
                                     application_url=url
                                 )
                                 async with stats_lock:
-                                    stats["emails_enqueued"] += len(emails)
+                                    stats["emails_enqueued"] += enqueued
                                     stats["applications_success"] += 1
                                     stats["processed"] += 1
 
                                 actor.log.info(
-                                    f"📥 Enqueued {len(emails)} emails for {company_info['company_name']} "
+                                    f"📥 Enqueued {enqueued}/{len(emails)} emails for {company_info['company_name']} "
                                     f"⚡ Worker will process asynchronously"
                                 )
                                 await log_to_backend(run_id, user_id, api_base, {
                                     "type": "success",
                                     "msg": (
-                                        f"📥 Enqueued {len(emails)} emails for {company_info['company_name']} "
+                                        f"📥 Enqueued {enqueued}/{len(emails)} emails for {company_info['company_name']} "
                                         f"⚡ Worker will process asynchronously"
                                     ),
                                     "job_title": title,
                                     "company": company_info['company_name'],
-                                    "emails_enqueued": len(emails)
+                                    "emails_enqueued": enqueued
                                 })
                             else:
                                 job_result.mark_failed("Enqueue request failed")
