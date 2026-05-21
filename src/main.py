@@ -116,15 +116,19 @@ async def send_callback_to_backend(
         print("[Callback] ⚠️ No valid API_BASE for callback")
         return False
 
-    successful = sum(1 for jr in job_results if jr.status == "success")
-    failed     = sum(1 for jr in job_results if jr.status in ("failed", "skipped"))
+    # "success" here means emails were enqueued for async delivery, not confirmed sent
+    successful           = sum(1 for jr in job_results if jr.status == "success")
+    failed               = sum(1 for jr in job_results if jr.status in ("failed", "skipped"))
+    total_emails_enqueued = sum(jr.emails_enqueued for jr in job_results)
 
     payload = {
         "run_id":                    run_id,
         "user_id":                   user_id,
         "status":                    status,
         "total_jobs":                total_jobs,
-        "successful_applications":   successful,
+        "jobs_with_emails_enqueued": successful,      # jobs where ≥1 email entered the queue
+        "successful_applications":   successful,      # kept for backend compatibility
+        "emails_enqueued":           total_emails_enqueued,  # total email items queued
         "failed_applications":       failed,
         "job_results":               [jr.to_dict() for jr in job_results],
         "error_message":             error_message,
@@ -459,8 +463,8 @@ async def run_actor():
             actor.log.info(f"🔄 Hunter Fallbacks:      {stats['hunter_fallbacks']}")
             actor.log.info(f"🌐 Scraping Hits:         {stats['scraping_hits']}")
             actor.log.info(f"🤖 AI Fallbacks:          {stats['ai_fallbacks']}")
-            actor.log.info(f"✅ Applications Success:  {stats['applications_success']}")
-            actor.log.info(f"❌ Applications Failed:   {stats['applications_failed']}")
+            actor.log.info(f"📥 Jobs w/ Emails Queued: {stats['applications_success']} (async delivery — not confirmed sent)")
+            actor.log.info(f"❌ Jobs Failed/Skipped:   {stats['applications_failed']}")
             actor.log.info(f"⏱️  Duration:              {int((datetime.utcnow() - started).total_seconds())}s")
             actor.log.info("=" * 60)
 

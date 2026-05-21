@@ -44,7 +44,7 @@ class EnrichmentPipeline:
         # ── STEP 1: search-person ─────────────────────────────────────────
         persons = await self.client.search_recruiters(domain)
         if not persons:
-            print(f"[Pipeline] ⚠️ No recruiter profiles found at {domain}")
+            print(f"[Pipeline] ℹ️ No recruiter matches for {domain} — falling through to Hunter.io")
             await self.cache.set(scan_key, "1", ttl=TTL_DOMAIN_SCAN)
             return [], stats
 
