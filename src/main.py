@@ -66,11 +66,16 @@ class RedisCache:
             print("[Redis] ⚠️ redis package not installed - using in-memory cache")
             return
 
-        url = self._redis_url
+        # Prefer public URL (reachable outside Railway) over internal URL
+        url = (
+            self._redis_url
+            or os.getenv("REDIS_PUBLIC_URL", "")
+            or os.getenv("REDIS_URL", "")
+        )
         if not url:
             host = os.getenv("REDISHOST", "")
             port = os.getenv("REDISPORT", "6379")
-            password = os.getenv("REDISPASSWORD", "")
+            password = os.getenv("REDIS_PASSWORD", "") or os.getenv("REDISPASSWORD", "")
             if host:
                 url = f"redis://:{password}@{host}:{port}" if password else f"redis://{host}:{port}"
 
@@ -1021,7 +1026,10 @@ async def run_actor():
         openai_key = input_data.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
         hunter_key = input_data.get("HUNTER_API_KEY") or os.getenv("HUNTER_API_KEY", "")
         prospeo_key = input_data.get("PROSPEO_API_KEY") or os.getenv("PROSPEO_API_KEY", "")
-        redis_url = input_data.get("REDIS_URL") or os.getenv("REDIS_URL", "")
+        redis_url = (
+            input_data.get("REDIS_PUBLIC_URL") or os.getenv("REDIS_PUBLIC_URL", "")
+            or input_data.get("REDIS_URL") or os.getenv("REDIS_URL", "")
+        )
 
         run_id = input_data.get("run_id")
         user_id = input_data.get("user_id")
