@@ -1,0 +1,488 @@
+import asyncio
+import re
+from typing import Dict, List, Optional, Set
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from playwright.async_api import Browser, Page, TimeoutError as PlaywrightTimeout
+from openai import AsyncOpenAI
+
+try:
+    import google.generativeai as genai
+    _GENAI_AVAILABLE = True
+except ImportError:
+    _GENAI_AVAILABLE = False
+
+try:
+    import dns.resolver as _dns_resolver
+    _DNS_AVAILABLE = True
+except ImportError:
+    _DNS_AVAILABLE = False
+
+from .redis_cache import RedisCache, TTL_RECRUITER, TTL_GEMINI_CD
+from .prospeo_client import ProspeoClient
+from .enrichment_pipeline import EnrichmentPipeline
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+JOB_BOARD_DOMAINS = [
+    'gulftalent.com', 'indeed.com', 'jooble.org', 'adzuna.com',
+    'linkedin.com', 'monster.com', 'glassdoor.com', 'naukri.com',
+    'bayt.com', 'apply.workable.com', 'jobs.lever.co', 'greenhouse.io',
+    'smartrecruiters.com', 'myworkdayjobs.com', 'icims.com',
+]
+
+_INVALID_DOMAIN_VALUES = {
+    'not identified', 'notidentified', 'unknown', 'none', 'null', 'n/a', 'na',
+    'localhost', 'not specified', 'notfound', 'not found', 'example.com',
+    'test.com', 'company.com', 'domain.com', '',
+}
+
+# =========================================================
+# DOMAIN HELPERS
+# =========================================================
+def normalize_domain(raw: str) -> str:
+    """Return clean FQDN or '' if invalid/placeholder."""
+    if not raw:
+        return ""
+    domain = raw.lower().strip()
+    domain = re.sub(r'^https?://', '', domain)
+    domain = domain.split('/')[0].split('?')[0].split('#')[0].strip()
+    domain = domain.replace(' ', '')
+    if not domain or domain in _INVALID_DOMAIN_VALUES:
+        return ""
+    if '.' not in domain:
+        return ""
+    tld = domain.rsplit('.', 1)[-1]
+    if not re.match(r'^[a-z]{2,6}$', tld):
+        return ""
+    if not re.match(r'^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?$', domain):
+        return ""
+    return domain
+
+
+def _is_ssl_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    return any(kw in msg for kw in ['ssl', 'certificate', 'tls', 'cert'])
+
+
+async def check_domain_alive(domain: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True, verify=False) as client:
+            resp = await client.head(f"https://{domain}", headers={"User-Agent": "Mozilla/5.0"})
+            return resp.status_code < 500
+    except Exception:
+        return False
+
+
+async def check_domain_has_mx(domain: str) -> bool:
+    if not _DNS_AVAILABLE:
+        return True
+    try:
+        records = await asyncio.wait_for(
+            asyncio.to_thread(_dns_resolver.resolve, domain, 'MX'),
+            timeout=5
+        )
+        return len(records) > 0
+    except Exception:
+        return False
+
+
+# =========================================================
+# AI COMPANY IDENTIFICATION
+# =========================================================
+class SmartCompanyDiscovery:
+    def __init__(self, gemini_key: str = "", openai_key: str = "", cache: Optional[RedisCache] = None):
+        self.cache = cache
+        self._gemini_error_count = 0
+        self.gemini_available = False
+
+        if gemini_key and _GENAI_AVAILABLE:
+            try:
+                genai.configure(api_key=gemini_key)
+                self.gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+                self.gemini_available = True
+                print("[AI] ✅ Gemini initialized")
+            except Exception as e:
+                print(f"[AI] ⚠️ Gemini init failed: {str(e)[:60]}")
+
+        self.openai_available = False
+        if openai_key:
+            try:
+                self.openai_client = AsyncOpenAI(api_key=openai_key)
+                self.openai_available = True
+                print("[AI] ✅ OpenAI initialized")
+            except Exception as e:
+                print(f"[AI] ⚠️ OpenAI init failed: {str(e)[:60]}")
+
+    async def identify_company(
+        self, job_description: str, job_title: str,
+        company_hint: str = "", job_url: str = ""
+    ) -> Optional[Dict]:
+        prompt = f"""Identify the ACTUAL HIRING COMPANY from this job posting. Return JSON only.
+
+Job Title: {job_title}
+Company Hint: {company_hint}
+URL: {job_url}
+Description: {job_description[:3000]}
+
+Rules:
+- Ignore job boards and recruitment agencies
+- Find the real employer's official domain
+- Only mark confidence "high" if clearly identified
+
+Return:
+{{"company_name":"...","company_domain":"domain.com","company_location":"City, Country","industry":"...","is_recruitment_agency":false,"confidence":"high|medium|low","reasoning":"..."}}"""
+
+        if self.gemini_available:
+            result = await self._try_gemini(prompt)
+            if result:
+                return result
+
+        if self.openai_available:
+            return await self._try_openai(prompt)
+
+        return None
+
+    async def _try_gemini(self, prompt: str) -> Optional[Dict]:
+        if self.cache and await self.cache.exists("gemini:cooldown"):
+            print("[Gemini] ⏸️ In cooldown - skipping to OpenAI")
+            return None
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.gemini_model.generate_content, prompt,
+                    generation_config={'temperature': 0.5, 'max_output_tokens': 512}
+                ),
+                timeout=25
+            )
+            match = re.search(r'\{[\s\S]*?\}', response.text.strip())
+            if match:
+                result = __import__('json').loads(match.group(0))
+                self._gemini_error_count = 0
+                print(f"[Gemini] ✅ {result.get('company_name')}")
+                return result
+        except asyncio.TimeoutError:
+            print("[Gemini] ⏱️ Timeout")
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "quota" in err or "rate" in err:
+                self._gemini_error_count += 1
+                print(f"[Gemini] ⚠️ Quota error #{self._gemini_error_count}")
+                if self._gemini_error_count >= 3 and self.cache:
+                    await self.cache.set("gemini:cooldown", "1", ttl=TTL_GEMINI_CD)
+                    print("[Gemini] ❌ Entering 30min cooldown")
+            else:
+                print(f"[Gemini] ❌ {str(e)[:80]}")
+        return None
+
+    async def _try_openai(self, prompt: str) -> Optional[Dict]:
+        try:
+            response = await asyncio.wait_for(
+                self.openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "Return valid JSON only."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.5, max_tokens=512,
+                    response_format={"type": "json_object"}
+                ),
+                timeout=25
+            )
+            result = __import__('json').loads(response.choices[0].message.content.strip())
+            print(f"[OpenAI] ✅ {result.get('company_name')}")
+            return result
+        except asyncio.TimeoutError:
+            print("[OpenAI] ⏱️ Timeout")
+        except Exception as e:
+            print(f"[OpenAI] ❌ {str(e)[:80]}")
+        return None
+
+
+# =========================================================
+# HUNTER.IO FALLBACK
+# =========================================================
+class HunterEmailDiscovery:
+    def __init__(self, api_key: str = ""):
+        self.api_key = api_key
+        self.available = bool(api_key)
+        if self.available:
+            print("[Hunter.io] ✅ Initialized")
+        else:
+            print("[Hunter.io] ⚠️ No API key - disabled")
+
+    async def find_company_emails(self, domain: str, company_name: str) -> List[str]:
+        if not self.available or not domain:
+            return []
+        print(f"[Hunter.io] 🔍 Searching {domain}...")
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    "https://api.hunter.io/v2/domain-search",
+                    params={'domain': domain, 'api_key': self.api_key, 'limit': 10, 'type': 'personal'}
+                )
+                if response.status_code == 200:
+                    emails = []
+                    for item in response.json().get('data', {}).get('emails', []):
+                        email = item.get('value', '').lower().strip()
+                        confidence = item.get('confidence', 0)
+                        is_hr = any(kw in email for kw in ['hr', 'recruit', 'talent', 'career', 'hiring'])
+                        if email and confidence >= (50 if is_hr else 70):
+                            emails.append(email)
+                            print(f"[Hunter.io]   ✅ {email} ({confidence}%)")
+                    print(f"[Hunter.io] ✅ {len(emails)} emails")
+                    return emails[:5]
+                if response.status_code == 429:
+                    print("[Hunter.io] ⚠️ Rate limit exceeded")
+                elif response.status_code == 401:
+                    print("[Hunter.io] ❌ Invalid API key")
+                else:
+                    print(f"[Hunter.io] ❌ HTTP {response.status_code}")
+        except asyncio.TimeoutError:
+            print("[Hunter.io] ⏱️ Timeout")
+        except Exception as e:
+            print(f"[Hunter.io] ❌ {str(e)[:80]}")
+        return []
+
+
+# =========================================================
+# PLAYWRIGHT SCRAPER FALLBACK
+# =========================================================
+class EnhancedEmailScraper:
+    @staticmethod
+    def _is_valid_email(email: str) -> bool:
+        if not email or '@' not in email:
+            return False
+        el = email.lower()
+        if any(d in el for d in JOB_BOARD_DOMAINS):
+            return False
+        if any(p in el for p in ['noreply', 'no-reply', 'donotreply', 'webmaster', 'postmaster', 'abuse@', 'privacy@', 'legal@']):
+            return False
+        return bool(re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email))
+
+    @staticmethod
+    async def _extract_emails_from_page(page: Page, domain: str) -> Set[str]:
+        emails: Set[str] = set()
+        try:
+            content = await page.content()
+            bare = domain.replace('www.', '')
+            for email in re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', content):
+                el = email.lower()
+                if (bare in el or any(kw in el for kw in ['hr', 'recruit', 'talent', 'career', 'hiring'])):
+                    if EnhancedEmailScraper._is_valid_email(email):
+                        emails.add(el)
+        except Exception:
+            pass
+        return emails
+
+    @staticmethod
+    async def _find_contact_links(page: Page) -> List[str]:
+        kws = ['contact', 'about', 'team', 'careers', 'jobs', 'hiring', 'recruit', 'join']
+        found: List[str] = []
+        for selector in ['nav a[href]', 'header a[href]', 'footer a[href]', '.navbar a[href]', '.menu a[href]']:
+            try:
+                for link in await page.query_selector_all(selector):
+                    href = await link.get_attribute('href')
+                    text = (await link.inner_text()).lower().strip()
+                    if href and any(k in text for k in kws):
+                        absolute = urljoin(page.url, href)
+                        if urlparse(absolute).netloc == urlparse(page.url).netloc and absolute not in found:
+                            found.append(absolute)
+            except Exception:
+                continue
+        return found
+
+    @staticmethod
+    async def scrape_company_emails_smart(browser: Browser, company_domain: str, company_name: str) -> Set[str]:
+        found: Set[str] = set()
+        domain = normalize_domain(company_domain)
+        if not domain:
+            return found
+
+        base_url = f"https://{domain}"
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        print(f"[Scraper] 🔍 Scraping: {domain}")
+
+        ssl_failed = False
+        for ignore_https in [False, True]:
+            if ignore_https and not ssl_failed:
+                break
+            ctx = None
+            try:
+                ctx = await browser.new_context(user_agent=ua, ignore_https_errors=ignore_https)
+                page = await ctx.new_page()
+                visited: Set[str] = set()
+                try:
+                    resp = await page.goto(base_url, timeout=20000, wait_until="domcontentloaded")
+                except PlaywrightTimeout:
+                    print(f"[Scraper] ⏱️ Timeout: {domain}")
+                    break
+                except Exception as e:
+                    if _is_ssl_error(e) and not ignore_https:
+                        ssl_failed = True
+                        print(f"[Scraper] 🔄 SSL error - retrying with ignoreHTTPSErrors")
+                        continue
+                    print(f"[Scraper] ⚠️ {str(e)[:60]}")
+                    break
+                if resp and resp.status < 500:
+                    found.update(await EnhancedEmailScraper._extract_emails_from_page(page, domain))
+                    visited.add(base_url)
+                    if len(found) < 3:
+                        for link in (await EnhancedEmailScraper._find_contact_links(page))[:4]:
+                            if link in visited or len(found) >= 5:
+                                break
+                            try:
+                                r = await page.goto(link, timeout=12000, wait_until="domcontentloaded")
+                                if r and r.status < 500:
+                                    found.update(await EnhancedEmailScraper._extract_emails_from_page(page, domain))
+                                visited.add(link)
+                            except Exception:
+                                continue
+                break
+            except Exception as e:
+                if _is_ssl_error(e) and not ignore_https:
+                    ssl_failed = True
+                    print(f"[Scraper] 🔄 SSL error - retrying with ignoreHTTPSErrors")
+                else:
+                    print(f"[Scraper] ⚠️ {str(e)[:60]}")
+                    break
+            finally:
+                if ctx:
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
+
+        print(f"[Scraper] 📊 Found {len(found)} emails")
+        return found
+
+
+# =========================================================
+# RECRUITER DISCOVERY — full priority chain
+# =========================================================
+class RecruiterDiscovery:
+    """
+    Priority: Prospeo (search→enrich) → Hunter → Scraping → AI generation
+    """
+
+    def __init__(
+        self,
+        browser: Browser,
+        prospeo: ProspeoClient,
+        cache: RedisCache,
+        hunter_key: str = "",
+        gemini_key: str = "",
+        openai_key: str = "",
+    ):
+        self.browser = browser
+        self.cache = cache
+        self.pipeline = EnrichmentPipeline(prospeo, cache)
+        self.hunter = HunterEmailDiscovery(hunter_key)
+        self.scraper = EnhancedEmailScraper()
+        self.company_ai = SmartCompanyDiscovery(gemini_key, openai_key, cache)
+
+    async def discover(
+        self,
+        job_description: str,
+        job_title: str,
+        company_hint: str = "",
+        job_url: str = "",
+    ) -> Dict:
+        print(f"[Discovery] 🚀 {company_hint or 'Unknown'}")
+
+        # ── AI: identify real company + domain ───────────────────────────
+        company_info = await self.company_ai.identify_company(
+            job_description, job_title, company_hint, job_url
+        )
+        if not company_info:
+            return _fail_result()
+
+        domain = normalize_domain(company_info.get('company_domain', ''))
+        if not domain:
+            print(f"[Discovery] ⚠️ AI returned invalid domain '{company_info.get('company_domain')}' — skipping {company_hint}")
+            return _fail_result(company_info)
+
+        print(f"[Discovery] 🏢 {company_info['company_name']} | 🌐 {domain}")
+
+        # ── Validate domain before any API calls ──────────────────────────
+        alive = await check_domain_alive(domain)
+        if not alive:
+            print(f"[Discovery] ⚠️ Domain {domain} unreachable - skipping")
+            return _fail_result(company_info)
+
+        emails: List[str] = []
+        method = "none"
+        pipeline_stats: Dict = {}
+
+        # ── STEP 1: Prospeo (search → enrich) ────────────────────────────
+        emails, pipeline_stats = await self.pipeline.discover_and_enrich(domain)
+        if emails:
+            method = "prospeo"
+            print(f"[Discovery] ✅ Prospeo: {len(emails)} verified emails — credits used: {pipeline_stats.get('credits_used', 0)}")
+        else:
+            print(f"[Discovery] 🔄 Prospeo empty — falling back to Hunter.io")
+            print(f"[Discovery]   Prospeo stats: found={pipeline_stats.get('persons_found', 0)} "
+                  f"enriched={pipeline_stats.get('persons_enriched', 0)} "
+                  f"rejected={pipeline_stats.get('emails_rejected', 0)}")
+
+        # ── STEP 2: Hunter.io fallback ────────────────────────────────────
+        if not emails:
+            emails = await self.hunter.find_company_emails(domain, company_info['company_name'])
+            if emails:
+                method = "hunter"
+            else:
+                print(f"[Discovery] 🔄 Hunter empty — falling back to scraping")
+
+        # ── STEP 3: Playwright scraping fallback ──────────────────────────
+        if not emails:
+            scraped = await self.scraper.scrape_company_emails_smart(
+                self.browser, domain, company_info['company_name']
+            )
+            emails = list(scraped)
+            if emails:
+                method = "scraped"
+            else:
+                print(f"[Discovery] 🔄 Scraping empty — checking domain for AI generation")
+
+        # ── STEP 4: AI generation — domain verified + MX only ────────────
+        if not emails:
+            has_mx = await check_domain_has_mx(domain)
+            if has_mx:
+                emails = [f"careers@{domain}", f"hr@{domain}"]
+                method = "generated"
+                print(f"[Discovery] ✉️ Generated 2 fallback emails (MX verified)")
+            else:
+                print(f"[Discovery] ❌ No MX records for {domain} — skipping generation")
+
+        emails = emails[:5]
+
+        # ── Cache results for non-generated emails ────────────────────────
+        if emails and method not in ("generated",):
+            await self.cache.set_json(f"recruiter_email:{domain}", emails, ttl=TTL_RECRUITER)
+            print(f"[Discovery] 🧠 Recruiter cached for {domain}")
+
+        print(f"[Discovery] ✅ {len(emails)} emails via {method.upper()}")
+
+        return {
+            'success': bool(emails),
+            'emails': emails,
+            'company_info': company_info,
+            'method': method,
+            'cache_hit': pipeline_stats.get('cache_hits', 0) > 0 and method == "prospeo",
+            'confidence': 'high' if method in ('prospeo', 'hunter', 'scraped') else 'low',
+            'prospeo_stats': pipeline_stats,
+        }
+
+
+def _fail_result(company_info: Optional[Dict] = None) -> Dict:
+    return {
+        'success': False,
+        'emails': [],
+        'company_info': company_info,
+        'method': 'failed',
+        'cache_hit': False,
+        'confidence': 'none',
+        'prospeo_stats': {},
+    }
