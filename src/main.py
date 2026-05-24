@@ -471,6 +471,9 @@ async def run_actor():
             elif already_contacted > 0 and failed == 0:
                 # All jobs were dedup-skipped — deduplication worked correctly
                 final_status = "completed"
+            elif already_contacted > 0:
+                # Mix of dedup skips + genuine failures — dedup worked, not a total failure
+                final_status = "partial"
             else:
                 final_status = "failed"
 

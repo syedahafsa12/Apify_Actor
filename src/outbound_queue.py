@@ -160,7 +160,8 @@ async def enqueue_emails_for_job(
     skip_reason is 'already_contacted' when dedup fired, '' otherwise.
     """
     company = job.get("company", "")
-    company_key = f"recruiter_company:{company.lower().replace(' ', '_')[:60]}"
+    # Scope per user so one user's history never blocks another user's run
+    company_key = f"recruiter_company:{user_id}:{company.lower().replace(' ', '_')[:60]}"
 
     if await cache.exists(company_key):
         print(f"[Enqueue] ⏭️ Company already contacted: {company}")
