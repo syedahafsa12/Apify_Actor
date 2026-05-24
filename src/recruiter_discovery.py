@@ -41,6 +41,72 @@ _INVALID_DOMAIN_VALUES = {
     'test.com', 'company.com', 'domain.com', '',
 }
 
+_COMPANY_SUFFIX_RE = re.compile(
+    r'\b(inc|llc|ltd|corp|co|company|group|global|solutions|technologies|tech|'
+    r'services|innovation|innovations|consulting|consultants|partners|ventures|'
+    r'systems|industries|enterprise|enterprises|agency|digital|labs|lab|studio|'
+    r'studios|international|worldwide|network|networks|software|cloud|ai|data)\b',
+    re.IGNORECASE,
+)
+
+_ALT_TLDS = ('com', 'io', 'co', 'net', 'org', 'ai', 'tech', 'app')
+
+
+def _company_name_to_slug(company_name: str) -> str:
+    """Derive a likely domain slug from a company name (strip suffixes, punctuation, spaces)."""
+    name = company_name.lower().strip()
+    name = re.sub(r'[^a-z0-9\s]', '', name)
+    name = _COMPANY_SUFFIX_RE.sub('', name).strip()
+    name = re.sub(r'\s+', '', name)
+    return name if len(name) >= 3 else ''
+
+
+def _domain_candidates(original_domain: str, company_name: str = '') -> List[str]:
+    """Return ordered list of alternative domains to probe when primary is unreachable."""
+    parts = original_domain.rsplit('.', 1)
+    base = parts[0] if len(parts) == 2 else original_domain
+    original_tld = parts[1] if len(parts) == 2 else ''
+
+    seen: Set[str] = {original_domain}
+    candidates: List[str] = []
+
+    for tld in _ALT_TLDS:
+        cand = f"{base}.{tld}"
+        if cand not in seen:
+            seen.add(cand)
+            candidates.append(cand)
+
+    if company_name:
+        slug = _company_name_to_slug(company_name)
+        if slug and slug != base:
+            for tld in _ALT_TLDS:
+                cand = f"{slug}.{tld}"
+                if cand not in seen:
+                    seen.add(cand)
+                    candidates.append(cand)
+
+    return candidates
+
+
+async def _find_live_alternative(original_domain: str, company_name: str = '') -> str:
+    """Try alternative TLDs / name slugs concurrently; return first live domain or ''."""
+    candidates = _domain_candidates(original_domain, company_name)
+    if not candidates:
+        return ''
+
+    async def _probe(d: str) -> str:
+        alive = await check_domain_alive(d)
+        return d if alive else ''
+
+    tasks = [asyncio.create_task(_probe(c)) for c in candidates]
+    for coro in asyncio.as_completed(tasks):
+        result = await coro
+        if result:
+            for t in tasks:
+                t.cancel()
+            return result
+    return ''
+
 # =========================================================
 # DOMAIN HELPERS
 # =========================================================
@@ -132,9 +198,10 @@ Rules:
 - Ignore job boards and recruitment agencies
 - Find the real employer's official domain
 - Only mark confidence "high" if clearly identified
+- List up to 3 plausible domains in order of likelihood (e.g. worthai.com, worth.ai, getworth.ai)
 
 Return:
-{{"company_name":"...","company_domain":"domain.com","company_location":"City, Country","industry":"...","is_recruitment_agency":false,"confidence":"high|medium|low","reasoning":"..."}}"""
+{{"company_name":"...","company_domain":"domain.com","domains":["domain.com","domain.io"],"company_location":"City, Country","industry":"...","is_recruitment_agency":false,"confidence":"high|medium|low","reasoning":"..."}}"""
 
         if self.mistral_available:
             result = await self._try_mistral(prompt)
@@ -403,61 +470,92 @@ class RecruiterDiscovery:
             return _fail_result()
 
         domain = normalize_domain(company_info.get('company_domain', ''))
-        if not domain:
-            print(f"[Discovery] ⚠️ AI returned invalid domain '{company_info.get('company_domain')}' — skipping {company_hint}")
+
+        # Build comprehensive candidate list:
+        # 1. AI primary domain  2. AI domains array  3. TLD variants of primary base
+        # Prospeo and Hunter work from domain strings — no reachability check needed for API calls.
+        _seen_domains: set = set()
+        _all_candidates: List[str] = []
+
+        def _add_cand(d: str) -> None:
+            d = normalize_domain(d)
+            if d and d not in _seen_domains:
+                _all_candidates.append(d)
+                _seen_domains.add(d)
+
+        _add_cand(domain)
+        for _d in (company_info.get('domains') or []):
+            _add_cand(_d)
+        # TLD variants of the primary base (e.g. dignifysolutions.io, .co, .ai …)
+        for _variant in _domain_candidates(domain, company_info.get('company_name', '')):
+            _add_cand(_variant)
+
+        if not _all_candidates:
+            print(f"[Discovery] ⚠️ AI returned no valid domains — skipping {company_hint}")
             return _fail_result(company_info)
 
-        print(f"[Discovery] 🏢 {company_info['company_name']} | 🌐 {domain}")
-
-        # ── Validate domain before any API calls ──────────────────────────
-        alive = await check_domain_alive(domain)
-        if not alive:
-            print(f"[Discovery] ⚠️ Domain {domain} unreachable - skipping")
-            return _fail_result(company_info)
+        company_name_display = company_info.get('company_name', company_hint or 'Unknown')
+        print(f"[Discovery] 🏢 {company_name_display} | probing {len(_all_candidates)} domain candidates")
 
         emails: List[str] = []
         method = "none"
         pipeline_stats: Dict = {}
+        winning_domain = _all_candidates[0]
 
-        # ── STEP 1: Prospeo (search → enrich) ────────────────────────────
-        emails, pipeline_stats = await self.pipeline.discover_and_enrich(domain)
-        if emails:
-            method = "prospeo"
-            print(f"[Discovery] ✅ Prospeo: {len(emails)} verified emails — credits used: {pipeline_stats.get('credits_used', 0)}")
-        else:
-            print(f"[Discovery] 🔄 Prospeo empty — falling back to Hunter.io")
-            print(f"[Discovery]   Prospeo stats: found={pipeline_stats.get('persons_found', 0)} "
-                  f"enriched={pipeline_stats.get('persons_enriched', 0)} "
-                  f"rejected={pipeline_stats.get('emails_rejected', 0)}")
+        # ── STEP 1+2: Prospeo then Hunter for EVERY candidate (no reachability gate) ──
+        for _cand in _all_candidates:
+            _p_emails, _p_stats = await self.pipeline.discover_and_enrich(_cand)
+            if _p_emails:
+                emails = _p_emails
+                pipeline_stats = _p_stats
+                method = "prospeo"
+                winning_domain = _cand
+                print(f"[Discovery] ✅ Prospeo: {len(emails)} at {_cand} — credits used: {_p_stats.get('credits_used', 0)}")
+                break
 
-        # ── STEP 2: Hunter.io fallback ────────────────────────────────────
-        if not emails:
-            emails = await self.hunter.find_company_emails(domain, company_info['company_name'])
-            if emails:
+            _h_emails = await self.hunter.find_company_emails(_cand, company_name_display)
+            if _h_emails:
+                emails = _h_emails
                 method = "hunter"
-            else:
-                print(f"[Discovery] 🔄 Hunter empty — falling back to scraping")
+                winning_domain = _cand
+                print(f"[Discovery] ✅ Hunter: {len(emails)} at {_cand}")
+                break
 
-        # ── STEP 3: Playwright scraping fallback ──────────────────────────
-        if not emails:
-            scraped = await self.scraper.scrape_company_emails_smart(
-                self.browser, domain, company_info['company_name']
-            )
-            emails = list(scraped)
-            if emails:
-                method = "scraped"
-            else:
-                print(f"[Discovery] 🔄 Scraping empty — checking domain for AI generation")
+            print(f"[Discovery] ℹ️ No results at {_cand} — trying next candidate")
 
-        # ── STEP 4: AI generation — domain verified + MX only ────────────
+        domain = winning_domain
+        company_info['company_domain'] = winning_domain
+
+        # ── STEP 3: Playwright scraping — only if primary domain is reachable ──
         if not emails:
-            has_mx = await check_domain_has_mx(domain)
-            if has_mx:
-                emails = [f"careers@{domain}", f"hr@{domain}"]
-                method = "generated"
-                print(f"[Discovery] ✉️ Generated 2 fallback emails (MX verified)")
+            domain_alive = await check_domain_alive(_all_candidates[0])
+            if domain_alive:
+                scraped = await self.scraper.scrape_company_emails_smart(
+                    self.browser, _all_candidates[0], company_name_display
+                )
+                emails = list(scraped)
+                if emails:
+                    method = "scraped"
+                    domain = _all_candidates[0]
+                    company_info['company_domain'] = domain
+                else:
+                    print(f"[Discovery] 🔄 Scraping empty — falling through to MX generation")
             else:
-                print(f"[Discovery] ❌ No MX records for {domain} — skipping generation")
+                print(f"[Discovery] ⏭️ Primary domain unreachable — skipping scraper")
+
+        # ── STEP 4: MX-verified generation — try top 3 candidates ────────────
+        if not emails:
+            for _cand in _all_candidates[:3]:
+                if await check_domain_has_mx(_cand):
+                    emails = [f"careers@{_cand}", f"hr@{_cand}"]
+                    method = "generated"
+                    domain = _cand
+                    company_info['company_domain'] = _cand
+                    print(f"[Discovery] ✉️ Generated fallback emails (MX verified: {_cand})")
+                    break
+            if not emails:
+                print(f"[Discovery] ❌ All {len(_all_candidates)} candidates exhausted")
+                return _fail_result(company_info)
 
         emails = emails[:5]
 
